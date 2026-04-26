@@ -1,0 +1,1 @@
+/usr/bin/g++ CMakeFiles/conv.dir/project1/conv.cu.o -o conv  -lcudadevrt -lcudart_static -lrt -lpthread -ldl  -L"/usr/local/cuda/targets/x86_64-linux/lib/stubs" -L"/usr/local/cuda/targets/x86_64-linux/lib"
