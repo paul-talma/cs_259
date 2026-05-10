@@ -1,7 +1,0 @@
-[
-{
-  "directory": "/workspace/ptalma/cs_259/build",
-  "command": "/usr/local/cuda/bin/nvcc -forward-unknown-to-host-compiler    --generate-code=arch=compute_native,code=[compute_native,sm_native] -x cu -c /workspace/ptalma/cs_259/project1/conv.cu -o CMakeFiles/conv.dir/project1/conv.cu.o",
-  "file": "/workspace/ptalma/cs_259/project1/conv.cu"
-}
-]

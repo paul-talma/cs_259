@@ -31,6 +31,8 @@
 /* ------------------------------------------------------------------ */
 
 #define D 64 /* head dimension — compile-time constant */
+#define Br 16
+#define Bc 16
 
 /* Row-major indexing into a [rows][D] matrix stored as a flat array */
 #define QKV(row, col) ((row)*D + (col))
@@ -240,6 +242,7 @@ __global__ void standard_prefill_kernel(
     int i = blockIdx.x;
     int d = threadIdx.x;
 
+    // extern __shared__ VTYPE local_scores[];
     VTYPE *local_scores = scores + S * i;
 
     float inv_sqrt = 1.f / sqrtf((float)D);
@@ -271,7 +274,6 @@ __global__ void standard_prefill_kernel(
             local_scores[j] = expf(local_scores[j] - mx);
             sum += local_scores[j];
         }
-
         for (int j = 0; j <= i; ++j) {
             local_scores[j] /= sum;
         }
@@ -289,9 +291,6 @@ __global__ void standard_prefill_kernel(
 /*
  * prefill_kernel -- flash attention, one thread per query row.
  *
- * Parallelisation: a 1-D grid of S threads, one thread per query i.
- * Each thread independently runs flash attention over keys j = 0..i,
- * accumulating into a private out[D] register array (D=64 floats).
  *
  * Limitations / optimisation targets:
  *  - No intra-query parallelism: threads do not cooperate on the D-wide
@@ -299,8 +298,6 @@ __global__ void standard_prefill_kernel(
  *  - Register pressure: out[D] costs 64 registers per thread, which
  *    limits the number of resident warps.  Consider mapping a thread
  *    block to each query so threads share the work across D.
- *  - Memory traffic: Q[i] and every K[j] / V[j] row is read from DRAM
- *    on every query.  Tile K and V into shared memory to amortise.
  *  - Warp-level dot products: use __shfl_down_sync to reduce the D
  *    partial products within a warp rather than looping serially.
  */
@@ -309,101 +306,214 @@ __global__ void prefill_kernel(const VTYPE *__restrict__ Q, /* [S * D] */
                                const VTYPE *__restrict__ V, /* [S * D] */
                                VTYPE *__restrict__ O,       /* [S * D] */
                                int S) {
-    // int i = blockIdx.x * blockDim.x + threadIdx.x;
-    // if (i >= S)
-    //     return;
-    //
-    // float inv_sqrt = 1.f / sqrtf((float)D);
-    //
-    // /* Private accumulator — D=64 floats live in registers. */
-    // float out[D];
-    // for (int d = 0; d < D; d++)
-    //     out[d] = 0.f;
-    // float m = -FLT_MAX, den = 0.f;
-    //
-    // /* Causal: query i attends to keys j = 0..i */
-    // for (int j = 0; j <= i; j++) {
-    //     float score = 0.f;
-    //     for (int d = 0; d < D; d++)
-    //         score += Q[QKV(i, d)] * K[QKV(j, d)];
-    //     score *= inv_sqrt;
-    //
-    //     float m_new = (score > m) ? score : m;
-    //     float correction = expf(m - m_new);
-    //     float exp_score = expf(score - m_new);
-    //
-    //     den = den * correction + exp_score;
-    //     for (int d = 0; d < D; d++)
-    //         out[d] = out[d] * correction + exp_score * V[QKV(j, d)];
-    //
-    //     m = m_new;
-    // }
-    //
-    // for (int d = 0; d < D; d++)
-    //     O[QKV(i, d)] = out[d] / den;
+
+    // dim3 block(D, Br): threadIdx.x = d ∈ [0,D-1], threadIdx.y = row ∈ [0,Br-1]
+    // Consecutive thread IDs share the same row and have consecutive d → coalesced
+    // global/KV reads and output writes.
+    int d   = threadIdx.x;  // output dimension [0, D-1]
+    int row = threadIdx.y;  // query row within tile [0, Br-1]
+    int i   = blockIdx.x * Br + row;
+
+    __shared__ VTYPE Qi[Br * D];
+    __shared__ VTYPE Oi[Br * D];
+    __shared__ VTYPE Kj[Bc * D];
+    __shared__ VTYPE Vj[Bc * D];
+    __shared__ VTYPE Sij[Br * Bc];
+    // One float per warp per (row, kv_col) for the cross-warp dot-product reduction.
+    // Each row spans D/32 = 2 warps; we store one partial per warp per Bc column.
+    __shared__ VTYPE dot_warp[Br * (D / 32) * Bc]; // Br * 2 * Bc floats
+    __shared__ VTYPE rowmax[Br];
+    __shared__ VTYPE rowmaxNew[Br];
+    __shared__ VTYPE rsum[Br];
+    __shared__ VTYPE rsumNew[Br];
+    __shared__ VTYPE corr[Br];
+
+    VTYPE inv_sqrt = 1.f / sqrtf((float)D);
+
+    // load Qi; init Oi — coalesced: same row, consecutive d → Q[i*D .. i*D+D-1]
+    Qi[row * D + d] = (i < S) ? Q[QKV(i, d)] : 0.f;
+    Oi[row * D + d] = 0.f;
+
+    if (d == 0) {
+        rowmax[row] = -INFINITY;
+        rsum[row]   = 0.f;
+    }
+    __syncthreads();
+
+    for (int kvOffset = 0; kvOffset < S; kvOffset += Bc) {
+        // Load Kj, Vj — coalesced: threadIdx.y=row ∈ [0,Br-1]==[0,Bc-1],
+        // threadIdx.x=d ∈ [0,D-1] → one element per thread, all consecutive.
+        int kvGlobal = kvOffset + row;
+        Kj[row * D + d] = (kvGlobal < S) ? K[QKV(kvGlobal, d)] : 0.f;
+        Vj[row * D + d] = (kvGlobal < S) ? V[QKV(kvGlobal, d)] : 0.f;
+        __syncthreads();
+
+        // Compute Sij[row][c] = Qi[row]·Kj[c] for all c ∈ [0,Bc).
+        //
+        // All D threads per row participate.  Within each row, threads span
+        // D/32 = 2 warps.  Strategy:
+        //   1. Each thread computes its partial: Qi[row*D+d] * Kj[c*D+d]
+        //   2. Warp-level reduction via __shfl_down_sync → lane 0 holds partial sum
+        //   3. Lane 0 of each warp writes to dot_warp[row*(D/32)*Bc + warp_in_row*Bc + c]
+        //   4. One thread per row assembles the final Sij entry.
+        //
+        // This keeps all 1024 threads busy vs. the prior 256-active approach.
+        {
+            int warp_in_row = d / 32;          // 0 or 1 (D=64 → 2 warps per row)
+            int lane        = d % 32;
+            for (int c = 0; c < Bc; ++c) {
+                float partial = Qi[row * D + d] * Kj[c * D + d];
+                // Warp-level reduction across 32 lanes
+                for (int off = 16; off >= 1; off >>= 1)
+                    partial += __shfl_down_sync(0xffffffff, partial, off);
+                if (lane == 0)
+                    dot_warp[row * (D / 32) * Bc + warp_in_row * Bc + c] = partial;
+            }
+        }
+        __syncthreads();
+
+        // Assemble Sij from warp partials, apply scale and causal mask.
+        // Only the first Bc threads in the row (d < Bc) do this.
+        if (d < Bc) {
+            float acc = 0.f;
+            for (int w = 0; w < D / 32; ++w)
+                acc += dot_warp[row * (D / 32) * Bc + w * Bc + d];
+            int kv_pos = kvOffset + d;
+            Sij[row * Bc + d] =
+                (i < S && kv_pos <= i) ? acc * inv_sqrt : -INFINITY;
+        }
+        __syncthreads();
+
+        // Rowmax and correction — one thread per row (d == 0)
+        if (d == 0) {
+            float mx = rowmax[row];
+            for (int k = 0; k < Bc; ++k)
+                mx = fmaxf(mx, Sij[row * Bc + k]);
+            rowmaxNew[row] = mx;
+            corr[row]      = expf(rowmax[row] - mx);
+        }
+        __syncthreads();
+
+        // Shift + exp Sij
+        if (d < Bc)
+            Sij[row * Bc + d] = expf(Sij[row * Bc + d] - rowmaxNew[row]);
+        __syncthreads();
+
+        // Accumulate row sum — one thread per row
+        if (d == 0) {
+            VTYPE rowSum = 0.f;
+            for (int k = 0; k < Bc; ++k)
+                rowSum += Sij[row * Bc + k];
+            rsumNew[row] = rsum[row] * corr[row] + rowSum;
+        }
+        __syncthreads();
+
+        // Value accumulation — all D threads participate, coalesced Vj access.
+        // Vj[k*D + d]: fixed k, consecutive d → no bank conflict.
+        VTYPE acc = 0.f;
+        for (int k = 0; k < Bc; ++k)
+            acc += Sij[row * Bc + k] * Vj[k * D + d];
+        Oi[row * D + d] = Oi[row * D + d] * corr[row] + acc;
+
+        if (d == 0) {
+            rowmax[row] = rowmaxNew[row];
+            rsum[row]   = rsumNew[row];
+        }
+        __syncthreads();
+    }
+
+    // Normalize and write back — coalesced: same row, consecutive d
+    if (i < S)
+        O[QKV(i, d)] = Oi[row * D + d] / rsum[row];
 }
 
 /*
  * decode_kernel -- flash attention for one query, one thread per output
  * dim.
  *
- * Parallelisation: a single block of D=64 threads.  Thread d owns
- * output element o[d] and streams through the KV cache applying online
- * softmax.  All D threads compute the same QK dot product independently
- * (D-fold redundancy) so the running state (m, den) remains consistent
- * across threads without synchronisation.
- *
- * Limitations / optimisation targets:
- *  - QK redundancy: every thread computes the full D-wide dot product
- *    for each key j.  Replace with a warp reduction over the 64 threads:
- *    each thread contributes q[d]*K[j*D+d], then __shfl_down_sync sums
- *    across the two warps, and the result is broadcast.
- *  - Only 64 threads are in flight; launch multiple blocks to process
- *    independent decode requests in parallel (batched decode).
- *  - For large C, tile K and V into shared memory and use __pipeline
- *    async copies to overlap memory transfers with computation.
  */
 __global__ void decode_kernel(const VTYPE *__restrict__ q, /* [D]     */
                               const VTYPE *__restrict__ K, /* [C * D] */
                               const VTYPE *__restrict__ V, /* [C * D] */
                               VTYPE *__restrict__ o,       /* [D]     */
                               int C) {
+
     /* One block of D threads; each thread d owns one output element. */
     int d = threadIdx.x;
     if (d >= D)
         return;
 
-    float inv_sqrt = 1.f / sqrtf((float)D);
+    __shared__ VTYPE Kj[Bc * D];
+    __shared__ VTYPE Vj[Bc * D];
+    __shared__ VTYPE scores[Bc];
+    __shared__ VTYPE correction;
+    __shared__ VTYPE maxNew;
+    __shared__ VTYPE sumNew;
+
+    VTYPE inv_sqrt = 1.f / sqrtf((float)D);
+    float max = -FLT_MAX, sum = 0.f;
     float out_d = 0.f;
-    float m = -FLT_MAX, den = 0.f;
 
-    for (int j = 0; j < C; j++) {
-        /*
-         * All D threads compute the same dot product — correct because
-         * every thread executes the identical sequence of operations and
-         * sees the same inputs, so FP results agree exactly.
-         * TODO: eliminate redundancy with __shfl_down_sync reduction.
-         */
-        float score = 0.f;
-        for (int dd = 0; dd < D; dd++)
-            score += q[dd] * K[QKV(j, dd)];
-        score *= inv_sqrt;
+    for (int kvOffset = 0; kvOffset < C; kvOffset += Bc) {
+        // initialize Kj, Vj
+        for (int row = 0; row < Bc; ++row) {
+            int kvGlobal = kvOffset + row;
+            Kj[QKV(row, d)] = (kvGlobal < C) ? K[QKV(kvGlobal, d)] : 0.f;
+            Vj[QKV(row, d)] = (kvGlobal < C) ? V[QKV(kvGlobal, d)] : 0.f;
+        }
+        __syncthreads();
 
-        float m_new = (score > m) ? score : m;
-        float correction = expf(m - m_new);
-        float exp_score = expf(score - m_new);
+        // compute score vector
+        if (d < Bc) {
+            float acc = 0.f;
+            for (int k = 0; k < D; ++k)
+                acc += q[k] * Kj[QKV(d, k)];
+            scores[d] = acc * inv_sqrt;
+        }
+        __syncthreads();
 
-        den = den * correction + exp_score;
-        out_d = out_d * correction + exp_score * V[QKV(j, d)];
+        // compute max
+        if (d == 0) {
+            maxNew = max;
+            for (int k = 0; k < Bc; ++k)
+                maxNew = (maxNew < scores[k]) ? scores[k] : maxNew;
+            correction = expf(max - maxNew);
+        }
+        __syncthreads();
 
-        m = m_new;
+        // shift + exp scores
+        if (d < Bc) {
+            scores[d] = (kvOffset + d < C) ? expf(scores[d] - maxNew) : 0.f;
+        }
+        __syncthreads();
+
+        // compute scores sum
+        if (d == 0) {
+            VTYPE sumRow = 0.f;
+            for (int k = 0; k < Bc; ++k)
+                sumRow += scores[k];
+            sumNew = correction * sum + sumRow;
+        }
+        __syncthreads();
+
+        // compute output
+        float acc = 0.f;
+        for (int k = 0; k < Bc; ++k)
+            acc += scores[k] * Vj[QKV(k, d)];
+        out_d = out_d * correction + acc;
+
+        // forward max, sum
+        if (d == 0) {
+            max = maxNew;
+            sum = sumNew;
+        }
+        __syncthreads();
     }
-
-    o[d] = out_d / den;
+    o[d] = out_d / sumNew;
 }
 
 /* ------------------------------------------------------------------ */
-/* Verify GPU output against CPU reference                             */
+/* Verify GPU output against CPU reference */
 /* ------------------------------------------------------------------ */
 
 static bool verify(const VTYPE *gpu_out,
@@ -428,15 +538,15 @@ static bool verify(const VTYPE *gpu_out,
 }
 
 /* ------------------------------------------------------------------ */
-/* Prefill benchmark                                                   */
+/* Prefill benchmark */
 /* ------------------------------------------------------------------ */
 
 static void run_prefill(int S,
                         bool skip_standard = false,
                         bool use_standard_kernel = false) {
     long long n = (long long)S * D;
-    /* Causal triangle: sum_{i=0}^{S-1}(i+1) * 2D = S*(S+1)*D each for QK
-     * and AV
+    /* Causal triangle: sum_{i=0}^{S-1}(i+1) * 2D = S*(S+1)*D each for
+     * QK and AV
      */
     long long flops = 2LL * S * (S + 1) * D;
 
@@ -459,7 +569,7 @@ static void run_prefill(int S,
         double t0 = omp_get_wtime();
         standard_prefill(Q, K, V, O_cpu, S);
         double ms = (omp_get_wtime() - t0) * 1e3;
-        printf("  %-38s  %8.2f ms\n", "CPU standard_prefill", ms);
+        printf("  %-38s  %8.4f ms\n", "CPU standard_prefill", ms);
     }
 
     /* ---- CPU flash_prefill (golden reference for GPU verify) ----- */
@@ -467,7 +577,7 @@ static void run_prefill(int S,
         double t0 = omp_get_wtime();
         flash_prefill(Q, K, V, O_cpu, S);
         double ms = (omp_get_wtime() - t0) * 1e3;
-        printf("  %-38s  %8.2f ms\n", "CPU flash_prefill", ms);
+        printf("  %-38s  %8.4f ms\n", "CPU flash_prefill", ms);
     }
 
     /* ---- GPU prefill_kernel -------------------------------------- */
@@ -492,14 +602,14 @@ static void run_prefill(int S,
 
         /* TODO: tune block size for your kernel */
         // const int BLOCK = D;
-        dim3 block(D);
-        dim3 grid(S);
 
         float gpu_ms = 0.f;
         if (use_standard_kernel) {
+            dim3 block(D);
+            dim3 grid(S);
             /* warmup */
-            standard_prefill_kernel<<<grid, block>>>(d_Q, d_K, d_V, d_O, scores,
-                                                     S);
+            standard_prefill_kernel<<<grid, block, S * sizeof(VTYPE)>>>(
+                d_Q, d_K, d_V, d_O, scores, S);
             CUDA_CHECK(cudaDeviceSynchronize());
 
             /* timed run */
@@ -520,6 +630,8 @@ static void run_prefill(int S,
                                   cudaMemcpyDeviceToHost));
 
         } else {
+            dim3 block(D, Br);   // threadIdx.x=d, threadIdx.y=row → coalesced
+            dim3 grid((S + Br - 1) / Br, 1);
             /* warm-up */
             prefill_kernel<<<grid, block>>>(d_Q, d_K, d_V, d_O, S);
             CUDA_CHECK(cudaDeviceSynchronize());
@@ -543,7 +655,7 @@ static void run_prefill(int S,
 
         bool ok = verify(O_gpu, O_cpu, n);
         double gflops = (double)flops * 1e-9 / (gpu_ms * 1e-3);
-        printf("  %-38s  %8.2f ms  %8.2f GFLOPS  %s\n", "GPU prefill_kernel",
+        printf("  %-38s  %8.4f ms  %8.4f GFLOPS  %s\n", "GPU prefill_kernel",
                gpu_ms, gflops, ok ? "PASS" : "FAIL");
 
         CUDA_CHECK(cudaFree(d_Q));
@@ -563,7 +675,7 @@ static void run_prefill(int S,
 }
 
 /* ------------------------------------------------------------------ */
-/* Decode benchmark                                                    */
+/* Decode benchmark */
 /* ------------------------------------------------------------------ */
 
 static void run_decode(int C) {
@@ -588,7 +700,7 @@ static void run_decode(int C) {
         double t0 = omp_get_wtime();
         standard_decode(q, K, V, o_cpu, C);
         double ms = (omp_get_wtime() - t0) * 1e3;
-        printf("  %-38s  %8.2f ms\n", "CPU standard_decode", ms);
+        printf("  %-38s  %8.4f ms\n", "CPU standard_decode", ms);
     }
 
     /* ---- GPU decode_kernel --------------------------------------- */
@@ -633,7 +745,7 @@ static void run_decode(int C) {
 
         bool ok = verify(o_gpu, o_cpu, D);
         double gflops = (double)flops * 1e-9 / (gpu_ms * 1e-3);
-        printf("  %-38s  %8.2f ms  %8.2f GFLOPS  %s\n", "GPU decode_kernel",
+        printf("  %-38s  %8.4f ms  %8.4f GFLOPS  %s\n", "GPU decode_kernel",
                gpu_ms, gflops, ok ? "PASS" : "FAIL");
 
         CUDA_CHECK(cudaFree(d_q));
@@ -651,7 +763,7 @@ static void run_decode(int C) {
 }
 
 /* ------------------------------------------------------------------ */
-/* main                                                                */
+/* main */
 /* ------------------------------------------------------------------ */
 
 int main(void) {
@@ -661,10 +773,10 @@ int main(void) {
     CUDA_CHECK(cudaGetDeviceProperties(&prop, dev));
     printf("=== Attention CUDA  device: %s  D=%d ===\n\n", prop.name, D);
 
-    run_prefill(4096, false, true);
-    // run_prefill(65536, /*skip_standard=*/true);
-    // run_decode(4096);
-    // run_decode(65536);
+    run_prefill(4096, true);
+    run_prefill(65536, /*skip_standard=*/true);
+    run_decode(4096);
+    run_decode(65536);
 
     return 0;
 }

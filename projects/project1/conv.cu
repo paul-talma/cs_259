@@ -1,281 +1,397 @@
-/*
- * conv.cu -- CUDA implementation of direct 2D convolution.
- *
- * VGG configurations:
- *   Conv1: 224x224  3x3  Ni=64   Nn=64
- *   Conv2:  14x14   3x3  Ni=512  Nn=512
- *
- * Data layout (matches CPU reference):
- *   Weights: [KY][KX][Nn][Ni]
- *   Input:   [B][NYPAD][NXPAD][Ni]   (zero-padded by one pixel on each side)
- *   Output:  [B][NYSCL][NXSCL][Nn]
- *
- * Compile: make
- * Run:     ./conv
- */
-
-#include <math.h>
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdlib>
+#include <cuda_runtime.h>
+#include <iomanip>
+#include <iostream>
+#include <string>
+#include <vector>
+#ifdef _OPENMP
 #include <omp.h>
-#include <stdio.h>
-#include <stdlib.h>
-
-/* ------------------------------------------------------------------ */
-/* Constants                                                           */
-/* ------------------------------------------------------------------ */
-
-#define KY 3 /* kernel height  */
-#define KX 3 /* kernel width   */
-#define SY 1 /* stride y       */
-#define SX 1 /* stride x       */
+#endif
 
 typedef float VTYPE;
+// Convolution parameters
+#define KY 3
+#define KX 3
+#define TILE_N                                                                 \
+    32 // output channels per block; equals warp size for full coalescing
+#define TILE_SP 8   // spatial rows per block (for smem weight reuse)
+#define NI_CHUNK 64 // input channels loaded into smem per iteration
 
-/* ------------------------------------------------------------------ */
-/* CUDA error checking                                                 */
-/* ------------------------------------------------------------------ */
+// Macros for indexing
+#define INPUT_IDX_3D(b, y, x, ni, NYPAD, NXPAD, Ni)                            \
+    ((((y) * (NXPAD) + (x)) * (Ni)) + (ni) + (b) * (NYPAD) * (NXPAD) * (Ni))
 
-#define CUDA_CHECK(call)                                                       \
+#define OUTPUT_IDX_3D(b, y, x, nn, NYSCL, NXSCL, Nn)                           \
+    ((((y) * (NXSCL) + (x)) * (Nn)) + (nn) + (b) * (NYSCL) * (NXSCL) * (Nn))
+
+#define SHARED_WEIGHT_IDX(ky, kx, ni, KX, Ni)                                  \
+    (((ky) * (KX) + (kx)) * (Ni) + (ni))
+
+#define WEIGHT_IDX(ky, kx, nn, ni, KX, Nn, Ni)                                 \
+    ((((ky) * (KX) + (kx)) * (Nn) + (nn)) * (Ni) + (ni))
+
+#define CHECK_CUDA(call)                                                       \
     do {                                                                       \
-        cudaError_t _e = (call);                                               \
-        if (_e != cudaSuccess) {                                               \
-            fprintf(stderr, "CUDA error %s:%d: %s\n", __FILE__, __LINE__,      \
-                    cudaGetErrorString(_e));                                   \
-            exit(1);                                                           \
+        cudaError_t err__ = (call);                                            \
+        if (err__ != cudaSuccess) {                                            \
+            std::cerr << "CUDA error at " << __FILE__ << ":" << __LINE__       \
+                      << " -> " << cudaGetErrorString(err__) << std::endl;     \
+            std::exit(EXIT_FAILURE);                                           \
         }                                                                      \
     } while (0)
 
-#define INPUT_IDX(row, col, inChannel, inWidth, inChannels)                    \
-    (((row) * (inWidth) * (inChannels)) + ((col) * (inChannels)) + (inChannel))
+__device__ float relu(float x) { return (x > 0.0f) ? x : 0.0f; }
 
-#define FILTER_IDX(row, col, outChannel, inChannel, filterWidth, outChannels,  \
-                   inChannels)                                                 \
-    (((row) * (filterWidth) * (outChannels) * (inChannels)) +                  \
-     ((col) * (outChannels) * (inChannels)) + ((outChannel) * (inChannels)) +  \
-     (inChannel))
+float relu_cpu(float x) { return (x > 0.0f) ? x : 0.0f; }
 
-#define OUTPUT_IDX(row, col, outChannel, outWidth, outChannels)                \
-    (((row) * (outWidth) * (outChannels)) + ((col) * (outChannels)) +          \
-     (outChannel))
-/* ------------------------------------------------------------------ */
-/* Helpers shared with CPU reference                                   */
-/* ------------------------------------------------------------------ */
+// GPU kernel
+__global__ void conv2d(const float *weight,
+                       const float *input,
+                       float *output,
+                       int B,
+                       int Ny,
+                       int Nx,
+                       int Ni,
+                       int Nn,
+                       int NYPAD,
+                       int NXPAD,
+                       int NYSCL,
+                       int NXSCL) {
 
-static __host__ __device__ VTYPE relu(VTYPE x) { return x > 0.f ? x : 0.f; }
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
 
-/* Deterministic fill — must match the CPU reference exactly. */
-static void fill(VTYPE *m, long long n, float scale, int seed) {
-    for (long long i = 0; i < n; i++)
-        m[i] = scale * sinf((float)(i * 3 + seed * 7));
-}
+    int bz = blockIdx.z;
+    int nn = bz % Nn; // feature map index
+    int b = bz / Nn;  // batch index
 
-/* ------------------------------------------------------------------ */
-/* CPU reference (for correctness verification)                        */
-/* ------------------------------------------------------------------ */
+    float output_entry = 0.0f;
+    float input_entry;
+    float weight_entry;
 
-static void
-cpu_convolution_layer(VTYPE *synapse,  /* [KY * KX * Nn * Ni]      */
-                      VTYPE *neuron_i, /* [B * NYPAD * NXPAD * Ni] */
-                      VTYPE *neuron_n, /* [B * NYSCL * NXSCL * Nn] */
-                      int B,
-                      int Ny,
-                      int Nx,
-                      int Ni,
-                      int Nn) {
-    int NXPAD = Nx + KX - 1, NYPAD = Ny + KY - 1;
-    int NXSCL = (Nx + SX - 1) / SX, NYSCL = (Ny + SY - 1) / SY;
-
-#pragma omp parallel for schedule(static) collapse(3)
-    for (int b = 0; b < B; b++)
-        for (int y = 0; y < Ny; y += SY)
-            for (int x = 0; x < Nx; x += SX) {
-                int yout = y / SY, xout = x / SX;
-                for (int nn = 0; nn < Nn; nn++) {
-                    VTYPE sum = 0.f;
-                    for (int ky = 0; ky < KY; ky++)
-                        for (int kx = 0; kx < KX; kx++)
-                            for (int i = 0; i < Ni; i++)
-                                sum += synapse[FILTER_IDX(ky, kx, nn, i, KX, Nn, Ni)] *
-                                       neuron_i[INPUT_IDX(b * NYPAD + ky + y, kx + x, i, NXPAD, Ni)];
-                    neuron_n[OUTPUT_IDX(b * NYSCL + yout, xout, nn, NXSCL, Nn)] = relu(sum);
+    if (col < Nx && row < Ny) {
+        for (int ky = 0; ky < KY; ky++) {
+            for (int kx = 0; kx < KX; kx++) {
+                for (int ni = 0; ni < Ni; ni++) {
+                    input_entry = input[INPUT_IDX_3D(b, ky + row, kx + col, ni,
+                                                     NYPAD, NXPAD, Ni)];
+                    weight_entry =
+                        weight[WEIGHT_IDX(ky, kx, nn, ni, KX, Nn, Ni)];
+                    // shared_weights[SHARED_WEIGHT_IDX(ky, kx, ni, KX, Ni)];
+                    output_entry += input_entry * weight_entry;
                 }
             }
+        }
+
+        output_entry = relu(output_entry);
+        output[OUTPUT_IDX_3D(b, row, col, nn, NYSCL, NXSCL, Nn)] = output_entry;
+    }
 }
 
-/* ------------------------------------------------------------------ */
-/* CUDA kernel (stub — implement this)                                 */
-/* ------------------------------------------------------------------ */
+// Optimized kernel: threadIdx.x indexes nn (output channel) so the 32 warp
+// lanes write 32 consecutive channel values — fully coalesced output store.
+// Input is broadcast across the warp (all lanes share the same spatial point).
+__global__ void conv2d_optimized(const float *weight,
+                                 const float *input,
+                                 float *output,
+                                 int B,
+                                 int Ny,
+                                 int Nx,
+                                 int Ni,
+                                 int Nn,
+                                 int NYPAD,
+                                 int NXPAD,
+                                 int NYSCL,
+                                 int NXSCL) {
 
-__global__ void
-conv_kernel(const VTYPE *__restrict__ synapse,  /* [KY][KX][Nn][Ni] */
-            const VTYPE *__restrict__ neuron_i, /* [B][NYPAD][NXPAD][Ni] */
-            VTYPE *__restrict__ neuron_n,       /* [B][NYSCL][NXSCL][Nn] */
-            int B,
-            int Ny,
-            int Nx,
-            int Ni,
-            int Nn) {
-    // padded input size
-    int NXPAD = Nx + KX - 1, NYPAD = Ny + KY - 1;
-    // output size
-    int NXSCL = (Nx + SX - 1) / SX, NYSCL = (Ny + SY - 1) / SY;
+    int col = blockIdx.x;
+    int row = blockIdx.y;
+    int Nn_tiles = (Nn + TILE_N - 1) / TILE_N;
+    int nn = (blockIdx.z % Nn_tiles) * TILE_N + threadIdx.x;
+    int b = blockIdx.z / Nn_tiles;
 
-    size_t outputCol = blockDim.x * blockIdx.x + threadIdx.x;
-    size_t outputRow = blockDim.y * blockIdx.y + threadIdx.y;
-    int b = blockIdx.z;
-
-    if (outputCol >= (size_t)NXSCL || outputRow >= (size_t)NYSCL)
+    if (nn >= Nn)
         return;
 
-    for (int nn = 0; nn < Nn; nn++) {
-        float sum = 0.f;
-        for (int ky = 0; ky < KY; ky++)
-            for (int kx = 0; kx < KX; kx++)
-                for (int i = 0; i < Ni; i++)
-                    sum += synapse[FILTER_IDX(ky, kx, nn, i, KX, Nn, Ni)] *
-                           neuron_i[(size_t)b * NYPAD * NXPAD * Ni +
-                                    INPUT_IDX(outputRow + ky, outputCol + kx, i, NXPAD, Ni)];
-
-        neuron_n[(size_t)b * NYSCL * NXSCL * Nn +
-                 OUTPUT_IDX(outputRow, outputCol, nn, NXSCL, Nn)] = relu(sum);
-    }
-}
-
-/* ------------------------------------------------------------------ */
-/* Verify GPU output against CPU reference                             */
-/* ------------------------------------------------------------------ */
-static bool verify(const VTYPE *gpu_out,
-                   const VTYPE *cpu_out,
-                   long long n,
-                   float tol = 1e-3f) {
-    long long mismatches = 0;
-    for (long long i = 0; i < n; i++) {
-        float diff = fabsf(gpu_out[i] - cpu_out[i]);
-        float ref = fabsf(cpu_out[i]) + 1e-6f;
-        if (diff / ref > tol) {
-            if (mismatches < 5)
-                fprintf(stderr, "  mismatch at [%lld]: gpu=%.6f  cpu=%.6f\n", i,
-                        gpu_out[i], cpu_out[i]);
-            mismatches++;
+    float sum = 0.f;
+    for (int ky = 0; ky < KY; ky++) {
+        for (int kx = 0; kx < KX; kx++) {
+            // All warp lanes share inp (same spatial point) -> broadcast, 1 txn
+            const float *inp = input + INPUT_IDX_3D(b, row + ky, col + kx, 0,
+                                                    NYPAD, NXPAD, Ni);
+            // Each lane has its own nn -> w is strided by Ni across lanes,
+            // but the TILE_N*Ni slice is contiguous and fits in L2 cache.
+            const float *w = weight + WEIGHT_IDX(ky, kx, nn, 0, KX, Nn, Ni);
+            for (int ni = 0; ni < Ni; ni++) {
+                sum += inp[ni] * w[ni];
+            }
         }
     }
-    if (mismatches > 0)
-        fprintf(stderr, "  %lld / %lld elements exceed tolerance %.1e\n",
-                mismatches, n, tol);
-    return mismatches == 0;
+
+    // Coalesced: 32 consecutive nn -> 32 consecutive floats in one cache line
+    output[OUTPUT_IDX_3D(b, row, col, nn, NYSCL, NXSCL, Nn)] = relu(sum);
 }
 
-/* ------------------------------------------------------------------ */
-/* Run one configuration                                               */
-/* ------------------------------------------------------------------ */
+// Smem kernel: combines channel coalescing (threadIdx.x -> nn) with spatial
+// tiling (TILE_SP rows per block) so TILE_SP threads share each weight load.
+// Per (ky, kx, ni_chunk): all 256 threads cooperatively load a
+// [TILE_N][NI_CHUNK] weight slice into smem, then each of the TILE_SP spatial
+// rows computes its partial dot-product using those cached weights.
+// smem layout: [TILE_N][NI_CHUNK+1] — the +1 padding column ensures that for
+// any fixed ni, thread t reads bank (t + ni) % 32, giving all 32 banks.
+__global__ void conv2d_smem(const float *weight,
+                            const float *input,
+                            float *output,
+                            int B,
+                            int Ny,
+                            int Nx,
+                            int Ni,
+                            int Nn,
+                            int NYPAD,
+                            int NXPAD,
+                            int NYSCL,
+                            int NXSCL) {
 
-static void run(const char *name, int B, int Ny, int Nx, int Ni, int Nn) {
-    int NYPAD = Ny + KY - 1, NXPAD = Nx + KX - 1;
-    int NYSCL = (Ny + SY - 1) / SY, NXSCL = (Nx + SX - 1) / SX;
+    extern __shared__ float smem[]; // TILE_N * (NI_CHUNK + 1) floats
 
-    long long syn_n = (long long)KY * KX * Nn * Ni;
-    long long inp_n = (long long)B * NYPAD * NXPAD * Ni;
-    long long out_n = (long long)B * NYSCL * NXSCL * Nn;
-    long long flops = 2LL * B * NYSCL * NXSCL * KY * KX * Ni * Nn;
+    int col = blockIdx.x;
+    int row = blockIdx.y * TILE_SP + threadIdx.y;
+    int Nn_tiles = (Nn + TILE_N - 1) / TILE_N;
+    int nn_tile = blockIdx.z % Nn_tiles;
+    int b = blockIdx.z / Nn_tiles;
+    int nn = nn_tile * TILE_N + threadIdx.x;
+    bool valid = (nn < Nn) && (row < NYSCL);
 
-    /* ---- host buffers -------------------------------------------- */
-    VTYPE *h_syn = (VTYPE *)malloc(syn_n * sizeof(VTYPE));
-    VTYPE *h_inp =
-        (VTYPE *)calloc(inp_n, sizeof(VTYPE)); /* calloc = zero padding */
-    VTYPE *h_out_cpu = (VTYPE *)malloc(out_n * sizeof(VTYPE));
-    VTYPE *h_out_gpu = (VTYPE *)malloc(out_n * sizeof(VTYPE));
+    int tid = threadIdx.y * TILE_N + threadIdx.x;
+    int block_threads = TILE_N * TILE_SP;
 
-    /* ---- initialise weights (same seed as CPU reference) ---------- */
-    fill(h_syn, syn_n, 0.01f, 1);
+    float sum = 0.f;
 
-    /* ---- initialise input (interior pixels only; border stays 0) -- */
-    for (int b = 0; b < B; b++)
-        for (int y = 0; y < Ny; y++)
-            for (int x = 0; x < Nx; x++)
-                for (int i = 0; i < Ni; i++)
-                    h_inp[((long long)(b * NYPAD + y) * NXPAD + x) * Ni + i] =
-                        0.01f * sinf((float)(b * Ny * Nx * Ni + y * Nx * Ni +
-                                             x * Ni + i));
+    for (int ky = 0; ky < KY; ky++) {
+        for (int kx = 0; kx < KX; kx++) {
+            for (int ni_base = 0; ni_base < Ni; ni_base += NI_CHUNK) {
+                int chunk =
+                    (ni_base + NI_CHUNK <= Ni) ? NI_CHUNK : (Ni - ni_base);
 
-    /* ---- CPU reference for correctness ---------------------------- */
-    cpu_convolution_layer(h_syn, h_inp, h_out_cpu, B, Ny, Nx, Ni, Nn);
+                // Cooperatively load weight[ky][kx][nn_tile*TILE_N..+TILE_N)
+                //                                  [ni_base..+chunk) into smem.
+                // Within each nn row, NI_CHUNK values are contiguous in global
+                // memory, so each warp's load touches consecutive addresses.
+                for (int s = tid; s < TILE_N * chunk; s += block_threads) {
+                    int nn_off = s / chunk;
+                    int ni_off = s % chunk;
+                    int global_nn = nn_tile * TILE_N + nn_off;
+                    smem[nn_off * (NI_CHUNK + 1) + ni_off] =
+                        (global_nn < Nn)
+                            ? weight[WEIGHT_IDX(ky, kx, global_nn,
+                                                ni_base + ni_off, KX, Nn, Ni)]
+                            : 0.f;
+                }
+                __syncthreads();
 
-    /* ---- GPU buffers ---------------------------------------------- */
-    VTYPE *d_syn, *d_inp, *d_out;
-    CUDA_CHECK(cudaMalloc(&d_syn, syn_n * sizeof(VTYPE)));
-    CUDA_CHECK(cudaMalloc(&d_inp, inp_n * sizeof(VTYPE)));
-    CUDA_CHECK(cudaMalloc(&d_out, out_n * sizeof(VTYPE)));
+                if (valid) {
+                    const float *inp =
+                        input + INPUT_IDX_3D(b, row + ky, col + kx, ni_base,
+                                             NYPAD, NXPAD, Ni);
+                    for (int ni = 0; ni < chunk; ni++) {
+                        // bank = (threadIdx.x * (NI_CHUNK+1) + ni) % 32
+                        //      = (threadIdx.x + ni) % 32  -> all 32 banks
+                        sum +=
+                            inp[ni] * smem[threadIdx.x * (NI_CHUNK + 1) + ni];
+                    }
+                }
+                __syncthreads();
+            }
+        }
+    }
 
-    CUDA_CHECK(cudaMemcpy(d_syn, h_syn, syn_n * sizeof(VTYPE),
-                          cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_inp, h_inp, inp_n * sizeof(VTYPE),
-                          cudaMemcpyHostToDevice));
-
-    /* ---- kernel launch -------------------------------------------- */
-    /* TODO: tune grid/block dimensions for your kernel */
-    dim3 block(16, 16, 1);
-    dim3 grid((NXSCL + block.x - 1) / block.x, (NYSCL + block.y - 1) / block.y,
-              B);
-
-    /* warm-up */
-    conv_kernel<<<grid, block>>>(d_syn, d_inp, d_out, B, Ny, Nx, Ni, Nn);
-    CUDA_CHECK(cudaDeviceSynchronize());
-
-    /* timed run */
-    cudaEvent_t t_start, t_stop;
-    CUDA_CHECK(cudaEventCreate(&t_start));
-    CUDA_CHECK(cudaEventCreate(&t_stop));
-
-    CUDA_CHECK(cudaEventRecord(t_start));
-    conv_kernel<<<grid, block>>>(d_syn, d_inp, d_out, B, Ny, Nx, Ni, Nn);
-    CUDA_CHECK(cudaEventRecord(t_stop));
-    CUDA_CHECK(cudaEventSynchronize(t_stop));
-
-    float ms = 0.f;
-    CUDA_CHECK(cudaEventElapsedTime(&ms, t_start, t_stop));
-    CUDA_CHECK(cudaEventDestroy(t_start));
-    CUDA_CHECK(cudaEventDestroy(t_stop));
-
-    /* ---- copy result back and verify ------------------------------ */
-    CUDA_CHECK(cudaMemcpy(h_out_gpu, d_out, out_n * sizeof(VTYPE),
-                          cudaMemcpyDeviceToHost));
-
-    bool ok = verify(h_out_gpu, h_out_cpu, out_n);
-    double gflops = (double)flops * 1e-9 / (ms * 1e-3);
-
-    printf("  %-12s B=%-2d  %8.2f ms  %8.2f GFLOPS  %s\n", name, B, ms, gflops,
-           ok ? "PASS" : "FAIL");
-
-    /* ---- cleanup -------------------------------------------------- */
-    CUDA_CHECK(cudaFree(d_syn));
-    CUDA_CHECK(cudaFree(d_inp));
-    CUDA_CHECK(cudaFree(d_out));
-    free(h_syn);
-    free(h_inp);
-    free(h_out_cpu);
-    free(h_out_gpu);
+    if (valid)
+        output[OUTPUT_IDX_3D(b, row, col, nn, NYSCL, NXSCL, Nn)] = relu(sum);
 }
 
-/* ------------------------------------------------------------------ */
-/* main                                                                */
-/* ------------------------------------------------------------------ */
+// CPU implementation
+void conv2d_cpu(const float *weight,
+                const float *input,
+                float *output,
+                int B,
+                int Ny,
+                int Nx,
+                int Ni,
+                int Nn,
+                int NYPAD,
+                int NXPAD,
+                int NYSCL,
+                int NXSCL) {
+#pragma omp parallel for collapse(4) schedule(static)
+    for (int b = 0; b < B; b++) {
+        for (int nn = 0; nn < Nn; nn++) {
+            for (int row = 0; row < Ny; row++) {
+                for (int col = 0; col < Nx; col++) {
+                    float sum = 0.0f;
+                    for (int ky = 0; ky < KY; ky++) {
+                        for (int kx = 0; kx < KX; kx++) {
+                            for (int ni = 0; ni < Ni; ni++) {
+                                float inp =
+                                    input[INPUT_IDX_3D(b, row + ky, col + kx,
+                                                       ni, NYPAD, NXPAD, Ni)];
+                                float w = weight[WEIGHT_IDX(ky, kx, nn, ni, KX,
+                                                            Nn, Ni)];
+                                sum += inp * w;
+                            }
+                        }
+                    }
+                    output[OUTPUT_IDX_3D(b, row, col, nn, NYSCL, NXSCL, Nn)] =
+                        relu_cpu(sum);
+                }
+            }
+        }
+    }
+}
 
-int main(void) {
-    int dev;
-    cudaDeviceProp prop;
-    CUDA_CHECK(cudaGetDevice(&dev));
-    CUDA_CHECK(cudaGetDeviceProperties(&prop, dev));
-    printf("=== Convolution CUDA  device: %s ===\n\n", prop.name);
+struct Config {
+    int Nx, Ny, Ni, Nn, B, stride;
+    std::string name;
+};
 
-    printf("  %-18s  %10s  %10s  %s\n", "Layer", "ms", "GFLOPS", "Correct");
-    printf("  %s\n",
-           "─────────────────────────────────────────────────────────────");
+int main() {
+    std::vector<Config> configs = {
+        {224, 224, 64, 64, 1, 1, "Conv1: Nx=Ny=224, Kx=Ky=3, Ni=Nn=64, B=1"},
+        {224, 224, 64, 64, 16, 1, "Conv1: Nx=Ny=224, Kx=Ky=3, Ni=Nn=64, B=16"},
+        {14, 14, 512, 512, 1, 1, "Conv2: Nx=Ny=14, Kx=Ky=3, Ni=Nn=512, B=1"},
+        {14, 14, 512, 512, 16, 1, "Conv2: Nx=Ny=14, Kx=Ky=3, Ni=Nn=512, B=16"},
+    };
 
-    /*        name     B    Ny   Nx   Ni    Nn  */
-    run("Conv1-VGG", 1, 224, 224, 64, 64);
-    run("Conv1-VGG", 16, 224, 224, 64, 64);
-    run("Conv2-VGG", 1, 14, 14, 512, 512);
-    run("Conv2-VGG", 16, 14, 14, 512, 512);
+    std::cout << std::fixed << std::setprecision(6);
+#ifdef _OPENMP
+    std::cout << "OpenMP CPU threads: " << omp_get_max_threads() << std::endl
+              << std::endl;
+#else
+    std::cout << "OpenMP CPU threads: disabled (compile with "
+                 "-Xcompiler -fopenmp)"
+              << std::endl
+              << std::endl;
+#endif
 
-    printf("\n");
+    for (auto &cfg : configs) {
+        int Nx = cfg.Nx, Ny = cfg.Ny, Ni = cfg.Ni, Nn = cfg.Nn, B = cfg.B;
+        int NXPAD = Nx + KX - 1;
+        int NYPAD = Ny + KY - 1;
+        int NXSCL = (Nx + cfg.stride - 1) / cfg.stride;
+        int NYSCL = (Ny + cfg.stride - 1) / cfg.stride;
+
+        size_t input_size = (size_t)NYPAD * NXPAD * Ni * B * sizeof(float);
+        size_t kernel_size = (size_t)KY * KX * Nn * Ni * sizeof(float);
+        size_t output_size = (size_t)NYSCL * NXSCL * Nn * B * sizeof(float);
+
+        // Allocate host memory
+        float *h_input       = (float *)malloc(input_size);
+        float *h_weight      = (float *)malloc(kernel_size);
+        float *h_output_cpu  = (float *)malloc(output_size);
+        float *h_output_smem = (float *)malloc(output_size);
+
+        if (!h_input || !h_weight || !h_output_cpu || !h_output_smem) {
+            std::cerr << "Host allocation failed for " << cfg.name << std::endl;
+            std::exit(EXIT_FAILURE);
+        }
+
+        // Initialize input with zero padding and varied positive values inside.
+        for (int b = 0; b < B; b++) {
+            for (int y = 0; y < NYPAD; y++) {
+                for (int x = 0; x < NXPAD; x++) {
+                    for (int ni = 0; ni < Ni; ni++) {
+                        bool is_padding = (y < KY / 2 || y >= NYPAD - KY / 2 ||
+                                           x < KX / 2 || x >= NXPAD - KX / 2);
+                        float value = 0.001f * (float)((b + 1) + (y % 17) +
+                                                       (x % 13) + (ni % 11));
+                        h_input[INPUT_IDX_3D(b, y, x, ni, NYPAD, NXPAD, Ni)] =
+                            is_padding ? 0.0f : value;
+                    }
+                }
+            }
+        }
+
+        // Initialize weights with varied positive values so
+        // channel/filter indexing bugs show up.
+        for (size_t i = 0; i < kernel_size / sizeof(float); i++) {
+            h_weight[i] = 0.001f * (float)((i % 23) + 1);
+        }
+
+        // CPU reference (for correctness check only)
+        conv2d_cpu(h_weight, h_input, h_output_cpu, B, Ny, Nx, Ni, Nn, NYPAD,
+                   NXPAD, NYSCL, NXSCL);
+
+        // GPU memory
+        float *d_input, *d_weight;
+        CHECK_CUDA(cudaMalloc((void **)&d_input, input_size));
+        CHECK_CUDA(cudaMalloc((void **)&d_weight, kernel_size));
+        CHECK_CUDA(cudaMemcpy(d_input, h_input, input_size, cudaMemcpyHostToDevice));
+        CHECK_CUDA(cudaMemcpy(d_weight, h_weight, kernel_size, cudaMemcpyHostToDevice));
+
+        // ---- conv2d_smem ----
+        float *d_output_smem;
+        CHECK_CUDA(cudaMalloc((void **)&d_output_smem, output_size));
+        CHECK_CUDA(cudaMemset(d_output_smem, 0, output_size));
+
+        int Nn_tiles = (Nn + TILE_N - 1) / TILE_N;
+        dim3 block_smem(TILE_N, TILE_SP);
+        dim3 grid_smem(NXSCL, (NYSCL + TILE_SP - 1) / TILE_SP, B * Nn_tiles);
+        size_t smem_bytes = TILE_N * (NI_CHUNK + 1) * sizeof(float);
+
+        // warmup
+        conv2d_smem<<<grid_smem, block_smem, smem_bytes>>>(
+            d_weight, d_input, d_output_smem, B, Ny, Nx, Ni, Nn,
+            NYPAD, NXPAD, NYSCL, NXSCL);
+        CHECK_CUDA(cudaDeviceSynchronize());
+
+        cudaEvent_t start_smem, stop_smem;
+        CHECK_CUDA(cudaEventCreate(&start_smem));
+        CHECK_CUDA(cudaEventCreate(&stop_smem));
+        CHECK_CUDA(cudaEventRecord(start_smem));
+        conv2d_smem<<<grid_smem, block_smem, smem_bytes>>>(
+            d_weight, d_input, d_output_smem, B, Ny, Nx, Ni, Nn,
+            NYPAD, NXPAD, NYSCL, NXSCL);
+        CHECK_CUDA(cudaGetLastError());
+        CHECK_CUDA(cudaEventRecord(stop_smem));
+        CHECK_CUDA(cudaEventSynchronize(stop_smem));
+
+        float smem_time_ms;
+        CHECK_CUDA(cudaEventElapsedTime(&smem_time_ms, start_smem, stop_smem));
+
+        CHECK_CUDA(cudaMemcpy(h_output_smem, d_output_smem, output_size,
+                              cudaMemcpyDeviceToHost));
+
+        bool correct_smem  = true;
+        float max_diff_smem = 0.0f;
+        for (size_t i = 0; i < output_size / sizeof(float); i++) {
+            float diff = std::fabs(h_output_cpu[i] - h_output_smem[i]);
+            if (diff > max_diff_smem) max_diff_smem = diff;
+            if (diff > 1e-5f) correct_smem = false;
+        }
+
+        long long ops = 2LL * KY * KX * Ni * B * NYSCL * NXSCL * Nn;
+        double smem_gflops = ops / (smem_time_ms * 1e-3) / 1e9;
+
+        std::cout << cfg.name << std::endl;
+        std::cout << "  conv2d_smem: " << smem_time_ms << " ms  "
+                  << smem_gflops << " GFLOPS  "
+                  << (correct_smem ? "PASS" : "FAIL")
+                  << " (max diff: " << max_diff_smem << ")" << std::endl;
+        std::cout << std::endl;
+
+        // Cleanup
+        free(h_input);
+        free(h_weight);
+        free(h_output_cpu);
+        free(h_output_smem);
+        CHECK_CUDA(cudaFree(d_input));
+        CHECK_CUDA(cudaFree(d_weight));
+        CHECK_CUDA(cudaFree(d_output_smem));
+        CHECK_CUDA(cudaEventDestroy(start_smem));
+        CHECK_CUDA(cudaEventDestroy(stop_smem));
+    }
+
     return 0;
 }
